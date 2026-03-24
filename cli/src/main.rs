@@ -54,34 +54,67 @@ fn print_json_error_with_type(message: impl AsRef<str>, error_type: &str) {
     }));
 }
 
-fn parse_proxy(proxy_str: &str) -> serde_json::Value {
+struct ParsedProxy {
+    server: String,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+fn parse_proxy(proxy_str: &str) -> ParsedProxy {
     let Some(protocol_end) = proxy_str.find("://") else {
-        return json!({ "server": proxy_str });
+        return ParsedProxy {
+            server: proxy_str.to_string(),
+            username: None,
+            password: None,
+        };
     };
     let protocol = &proxy_str[..protocol_end + 3];
     let rest = &proxy_str[protocol_end + 3..];
 
     let Some(at_pos) = rest.rfind('@') else {
-        return json!({ "server": proxy_str });
+        return ParsedProxy {
+            server: proxy_str.to_string(),
+            username: None,
+            password: None,
+        };
     };
 
     let creds = &rest[..at_pos];
     let server_part = &rest[at_pos + 1..];
     let server = format!("{}{}", protocol, server_part);
 
-    let Some(colon_pos) = creds.find(':') else {
-        return json!({
-            "server": server,
-            "username": creds,
-            "password": ""
-        });
+    let (username, password) = match creds.find(':') {
+        Some(colon_pos) => {
+            let u = &creds[..colon_pos];
+            let p = &creds[colon_pos + 1..];
+            (
+                if u.is_empty() {
+                    None
+                } else {
+                    Some(u.to_string())
+                },
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(p.to_string())
+                },
+            )
+        }
+        None => (
+            if creds.is_empty() {
+                None
+            } else {
+                Some(creds.to_string())
+            },
+            None,
+        ),
     };
 
-    json!({
-        "server": server,
-        "username": &creds[..colon_pos],
-        "password": &creds[colon_pos + 1..]
-    })
+    ParsedProxy {
+        server,
+        username,
+        password,
+    }
 }
 
 fn run_session(args: &[String], session: &str, json_mode: bool) {
@@ -330,6 +363,13 @@ fn main() {
         return;
     }
 
+    // Parse proxy URL to separate server from credentials for the daemon.
+    let (proxy_server, proxy_username, proxy_password) = if let Some(ref proxy_str) = flags.proxy {
+        let parsed = parse_proxy(proxy_str);
+        (Some(parsed.server), parsed.username, parsed.password)
+    } else {
+        (None, None, None)
+    };
     let daemon_opts = DaemonOptions {
         headed: flags.headed,
         debug: flags.debug,
@@ -337,8 +377,10 @@ fn main() {
         extensions: &flags.extensions,
         args: flags.args.as_deref(),
         user_agent: flags.user_agent.as_deref(),
-        proxy: flags.proxy.as_deref(),
+        proxy: proxy_server.as_deref(),
         proxy_bypass: flags.proxy_bypass.as_deref(),
+        proxy_username: proxy_username.as_deref(),
+        proxy_password: proxy_password.as_deref(),
         ignore_https_errors: flags.ignore_https_errors,
         allow_file_access: flags.allow_file_access,
         profile: flags.profile.as_deref(),
@@ -694,12 +736,16 @@ fn main() {
         }
 
         if let Some(ref proxy_str) = flags.proxy {
-            let mut proxy_obj = parse_proxy(proxy_str);
-            // Add bypass if specified
+            let parsed = parse_proxy(proxy_str);
+            let mut proxy_obj = json!({ "server": parsed.server });
+            if let Some(ref username) = parsed.username {
+                proxy_obj["username"] = json!(username);
+            }
+            if let Some(ref password) = parsed.password {
+                proxy_obj["password"] = json!(password);
+            }
             if let Some(ref bypass) = flags.proxy_bypass {
-                if let Some(obj) = proxy_obj.as_object_mut() {
-                    obj.insert("bypass".to_string(), json!(bypass));
-                }
+                proxy_obj["bypass"] = json!(bypass);
             }
             cmd_obj.insert("proxy".to_string(), proxy_obj);
         }
@@ -1007,55 +1053,55 @@ mod tests {
     #[test]
     fn test_parse_proxy_simple() {
         let result = parse_proxy("http://proxy.com:8080");
-        assert_eq!(result["server"], "http://proxy.com:8080");
-        assert!(result.get("username").is_none());
-        assert!(result.get("password").is_none());
+        assert_eq!(result.server, "http://proxy.com:8080");
+        assert!(result.username.is_none());
+        assert!(result.password.is_none());
     }
 
     #[test]
     fn test_parse_proxy_with_auth() {
         let result = parse_proxy("http://user:pass@proxy.com:8080");
-        assert_eq!(result["server"], "http://proxy.com:8080");
-        assert_eq!(result["username"], "user");
-        assert_eq!(result["password"], "pass");
+        assert_eq!(result.server, "http://proxy.com:8080");
+        assert_eq!(result.username.as_deref(), Some("user"));
+        assert_eq!(result.password.as_deref(), Some("pass"));
     }
 
     #[test]
     fn test_parse_proxy_username_only() {
         let result = parse_proxy("http://user@proxy.com:8080");
-        assert_eq!(result["server"], "http://proxy.com:8080");
-        assert_eq!(result["username"], "user");
-        assert_eq!(result["password"], "");
+        assert_eq!(result.server, "http://proxy.com:8080");
+        assert_eq!(result.username.as_deref(), Some("user"));
+        assert!(result.password.is_none());
     }
 
     #[test]
     fn test_parse_proxy_no_protocol() {
         let result = parse_proxy("proxy.com:8080");
-        assert_eq!(result["server"], "proxy.com:8080");
-        assert!(result.get("username").is_none());
+        assert_eq!(result.server, "proxy.com:8080");
+        assert!(result.username.is_none());
     }
 
     #[test]
     fn test_parse_proxy_socks5() {
         let result = parse_proxy("socks5://proxy.com:1080");
-        assert_eq!(result["server"], "socks5://proxy.com:1080");
-        assert!(result.get("username").is_none());
+        assert_eq!(result.server, "socks5://proxy.com:1080");
+        assert!(result.username.is_none());
     }
 
     #[test]
     fn test_parse_proxy_socks5_with_auth() {
         let result = parse_proxy("socks5://admin:secret@proxy.com:1080");
-        assert_eq!(result["server"], "socks5://proxy.com:1080");
-        assert_eq!(result["username"], "admin");
-        assert_eq!(result["password"], "secret");
+        assert_eq!(result.server, "socks5://proxy.com:1080");
+        assert_eq!(result.username.as_deref(), Some("admin"));
+        assert_eq!(result.password.as_deref(), Some("secret"));
     }
 
     #[test]
     fn test_parse_proxy_complex_password() {
         let result = parse_proxy("http://user:p@ss:w0rd@proxy.com:8080");
-        assert_eq!(result["server"], "http://proxy.com:8080");
-        assert_eq!(result["username"], "user");
-        assert_eq!(result["password"], "p@ss:w0rd");
+        assert_eq!(result.server, "http://proxy.com:8080");
+        assert_eq!(result.username.as_deref(), Some("user"));
+        assert_eq!(result.password.as_deref(), Some("p@ss:w0rd"));
     }
 
     #[test]
