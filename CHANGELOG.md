@@ -1,5 +1,150 @@
 # agent-browser
 
+## 0.23.0
+
+### Minor Changes
+
+- 0f0f300: ### New Features
+
+  - **Observability dashboard** - Added a local web UI (`dashboard`) that shows live browser viewports, command activity feeds, console output, network requests, storage, and extensions for all sessions. Manage it with `dashboard start`, `dashboard stop`, and `dashboard install`. The dashboard runs as a standalone background process and all sessions stream to it automatically (#1034)
+  - **Runtime stream management** - Added `stream enable`, `stream disable`, and `stream status` commands to control WebSocket streaming at runtime. Streaming is now always enabled by default; `AGENT_BROWSER_STREAM_PORT` overrides the port instead of toggling the feature (#951)
+  - **Close all sessions** - Added `close --all` flag to close every active browser session at once
+
+  ### Bug Fixes
+
+  - Fixed **Lightpanda engine** compatibility (#1050)
+  - Fixed **Windows daemon TCP bind** failing when Hyper-V reserves the port by falling back to an OS-assigned port and writing it to a `.port` file (#1041)
+  - Fixed **Windows dashboard relay** using Unix socket instead of TCP (#1038)
+  - Fixed **radio/checkbox elements** being dropped from compact snapshot tree because the `ref=` check required a leading `[` that those elements lack (#1008)
+
+## 0.22.3
+
+### Patch Changes
+
+- eb64ca4: ### Bug Fixes
+
+  - **Re-apply download behavior on recording context** - Fixed an issue where downloads were silently dropped in recording contexts because `Browser.setDownloadBehavior` set at launch only applied to the default context. The download behavior is now re-applied when a new recording context is created (#1019)
+  - **Reap zombie Chrome process and fast-detect crash for auto-restart** - Added a non-blocking process-exit check before attempting CDP connection checks. This prevents a 3-second CDP timeout when Chrome has already crashed or exited, enabling faster detection and auto-restart of the browser (#1023)
+  - **Route keyboard `type` through text input** - Fixed keyboard `type` subaction to correctly route through the text input handler, and added support for an `insertText` subaction using `Input.insertText` (#1014)
+  - **Handle `--clear` flag in `console` command** - Fixed the `console` command to accept and process a `clear` parameter, allowing console event history to be cleared (#1015)
+
+## 0.22.2
+
+### Patch Changes
+
+- a098197: ### New Features
+
+  - **Dialog status command** - Added `dialog status` command to check whether a JavaScript dialog is currently open (#999)
+  - **Dialog warning field** - Command responses now include a `warning` field when a JavaScript dialog is pending, indicating the dialog type and message (#999)
+
+  ### Improvements
+
+  - **Standard proxy environment variables** - The proxy setting now automatically falls back to standard environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and their lowercase variants), with `NO_PROXY`/`no_proxy` respected for bypass rules (#1000)
+  - **Font packages for `--with-deps`** - Installing with `--with-deps` now includes CJK and emoji font packages on Linux (Debian, RPM, and yum-based distros) to prevent missing glyphs when rendering international content (#1002)
+
+  ### Bug Fixes
+
+  - Fixed `state show` always failing with "Missing 'path' parameter" due to a mismatched JSON field name (`filename` → `path`) (#994)
+  - Fixed `console` command returning only `Done` due to a JSON field name mismatch in the response (#986)
+  - Fixed browser-domain CDP events being dropped during downloads due to a `sessionId` mismatch (#998)
+  - Fixed proxy authentication by handling credentials via the CDP `Fetch.authRequired` event rather than passing them inline (#1000)
+
+## 0.22.1
+
+### Patch Changes
+
+- 3a3317b: ### Bug Fixes
+
+  - Fixed **modifier key chords** (e.g. `Control+a`, `Shift+Enter`, `Control+Shift+a`) not being handled correctly when using `press`. Modifier keys (`Alt`, `Control`/`Ctrl`, `Meta`/`Cmd`, `Shift`) are now parsed and forwarded as CDP modifier bitmasks rather than treated as part of the key name (#980)
+  - Fixed **query parameters being dropped** from `--cdp` HTTP URLs (e.g. `http://host:9222?mode=Hello`). Query strings are now preserved and forwarded to the remote CDP endpoint (#982)
+
+## 0.22.0
+
+### Minor Changes
+
+- be30bc9: ### New Features
+
+  - **Cross-origin iframe support** - Added support for snapshots and interactions within cross-origin iframes via `Target.setAutoAttach` (#949)
+  - **Network request detail and filtering** - Added `network request <requestId>` command to view full request/response detail, and new filtering options for `network requests` including `--type` (e.g. `xhr,fetch`), `--method` (e.g. `POST`), and `--status` (e.g. `2xx`, `400-499`) (#935)
+
+  ### Improvements
+
+  - **Snapshot usability** - Reduced AI cognitive load by filtering semantic noise from snapshot output; cursor-interactive elements are now included by default, making the `-C` flag unnecessary (#968)
+  - **Upgrade command** - Improved robustness of installation method detection in the upgrade command (#960)
+  - **Target tracking** - Enhanced target tracking and page information handling for more reliable browser session management (#969)
+
+  ### Bug Fixes
+
+  - Fixed **viewport dimensions** being reported incorrectly in streaming status messages and screencast (#952)
+  - Fixed **`find` command** flags such as `--exact` and `--name` leaking into fill values when used with fill actions (#955)
+  - Fixed **state commands** incorrectly starting the daemon when no `session_name` is provided (#677, #964)
+  - Fixed **auto-connect** triggering when the daemon is already running, preventing duplicate connections (#971)
+  - Fixed **Enter key press** not working by adding a text field to `keyDown` events (#972)
+  - Fixed **download command** to properly handle absolute paths and correctly click target elements (#970)
+
+  ### Breaking Changes
+
+  - The `-C` / `--cursor` flag for `snapshot` is deprecated; cursor-interactive elements are now included by default and the flag has no additional effect (#968)
+
+  ### Documentation
+
+  - Updated `README.md` with new `network requests` filtering options and `network request <requestId>` command usage
+  - Removed references to the deprecated `-C` / `--cursor` snapshot flag from docs and command reference
+
+## 0.21.4
+
+### Patch Changes
+
+- aed466b: ### Bug Fixes
+
+  - **Auth login readiness** - `agent-browser auth login` now navigates with `load`, waits for usable login form selectors, and uses staged username detection (targeted email/username selectors first, then broad text-input fallback). This reduces SPA timing failures, avoids false matches on unrelated text fields, and prevents `networkidle` hangs on pages with continuous background requests.
+
+## 0.21.3
+
+### Patch Changes
+
+- 6daad22: ### Bug Fixes
+
+  - **WebSocket keepalive for remote browsers** - Added WebSocket Ping frames and TCP `SO_KEEPALIVE` to prevent CDP connections from being silently dropped by intermediate proxies (reverse proxies, load balancers, service meshes) during idle periods (#936)
+  - **XPath selector support** - Fixed element resolution to correctly handle the `xpath=` selector prefix (#908)
+
+  ### Performance
+
+  - **Fast-path for identical snapshots** - Short-circuits the Myers diff algorithm when comparing a snapshot to itself, avoiding unnecessary computation in retry and loop workloads where repeated identical snapshots are common (#922)
+
+  ### Documentation
+
+  - Migrated page metadata from MDX files to `layout.tsx` (#904)
+  - Added search functionality and color improvements to docs (#927)
+  - Fixed desktop browser list in the iOS comparison table (#926)
+  - Created a new `providers/` section with dedicated provider pages (#928)
+
+## 0.21.2
+
+### Patch Changes
+
+- 757626f: ### Bug Fixes
+
+  - **Deduplicate text content in snapshots** - Fixed an issue where duplicate text content appeared in page snapshots (#909)
+  - **Native mouse drag state** - Fixed incorrect raw native mouse drag state not being properly tracked across `down`, `move`, and `up` events (#872)
+  - **Chrome headless launch failures** - Fixed browser launch failures caused by the `--enable-unsafe-swiftshader` flag in Chrome headless mode (#915)
+  - **Origin-scoped `--headers` persistence** - Restored correct persistence of origin-scoped headers set via `--headers` across navigation commands (#894)
+  - **Relative URLs in WebSocket domain filter** - Fixed handling of relative URLs in the WebSocket domain filter script (#624)
+
+## 0.21.1
+
+### Patch Changes
+
+- 1e7619d: ### New Features
+
+  - **HAR 1.2 network capture** - Added commands to capture and export network traffic in HAR 1.2 format, including accurate request/response timing, headers, body sizes, and resource types sourced from Chrome DevTools Protocol events (#864)
+  - **Built-in `upgrade` command** - Added `agent-browser upgrade` to self-update the CLI; automatically detects your installation method (npm, Homebrew, or Cargo) and runs the appropriate update command (#898)
+
+  ### Documentation
+
+  - Added `upgrade` command to the README command reference and installation guide
+  - Added a dedicated **Updating** section to the README with usage instructions for `agent-browser upgrade`
+
 ## 0.21.0
 
 ### Minor Changes

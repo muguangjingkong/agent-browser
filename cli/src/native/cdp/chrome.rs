@@ -17,6 +17,17 @@ impl ChromeProcess {
         let _ = self.child.wait();
     }
 
+    /// Returns the OS process ID of the Chrome child process.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Non-blocking check whether Chrome has exited.
+    /// Returns `true` if the process has exited (and reaps it), `false` if still running.
+    pub fn has_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)) | Err(_))
+    }
+
     /// Wait for Chrome to exit on its own (after Browser.close CDP command),
     /// falling back to kill() if it doesn't exit within the timeout.
     /// This allows Chrome to flush cookies and other state to the user-data-dir.
@@ -67,6 +78,8 @@ pub struct LaunchOptions {
     pub executable_path: Option<String>,
     pub proxy: Option<String>,
     pub proxy_bypass: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
     pub profile: Option<String>,
     pub args: Vec<String>,
     pub allow_file_access: bool,
@@ -85,6 +98,8 @@ impl Default for LaunchOptions {
             executable_path: None,
             proxy: None,
             proxy_bypass: None,
+            proxy_username: None,
+            proxy_password: None,
             profile: None,
             args: Vec::new(),
             allow_file_access: false,
@@ -133,6 +148,11 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     // injected in headless mode).  Skip --headless when extensions are loaded.
     if options.headless && !has_extensions {
         args.push("--headless=new".to_string());
+        // Enable SwiftShader software rendering in headless mode.  This
+        // prevents silent crashes in environments where GPU drivers are
+        // missing or restricted (VMs, containers, some cloud machines)
+        // while preserving WebGL support.  Playwright uses the same flag.
+        args.push("--enable-unsafe-swiftshader".to_string());
     }
 
     if let Some(ref proxy) = options.proxy {
@@ -303,9 +323,17 @@ fn wait_for_devtools_active_port(
     let poll_interval = Duration::from_millis(50);
 
     while std::time::Instant::now() <= deadline {
-        if let Ok(Some(_status)) = child.try_wait() {
-            // If Chrome already exited, stop waiting.
-            break;
+        if let Ok(Some(status)) = child.try_wait() {
+            // Chrome exited before writing DevToolsActivePort -- report the
+            // exit code so the caller can surface it alongside stderr output.
+            let code = status
+                .code()
+                .map(|c| format!("{}", c))
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(format!(
+                "Chrome exited early (exit code: {}) without writing DevToolsActivePort",
+                code
+            ));
         }
 
         if let Some((port, ws_path)) = read_devtools_active_port(user_data_dir) {
@@ -364,7 +392,10 @@ fn chrome_launch_error(message: &str, stderr_lines: &[String]) -> String {
 
     if relevant.is_empty() {
         if stderr_lines.is_empty() {
-            return format!("{} (no stderr output from Chrome)", message);
+            return format!(
+                "{} (no stderr output from Chrome)\nHint: try passing --args \"--no-sandbox\" if Chrome crashes silently in your environment",
+                message
+            );
         }
         let last_lines: Vec<&String> = stderr_lines.iter().rev().take(5).collect();
         return format!(
@@ -498,7 +529,7 @@ pub async fn auto_connect_cdp() -> Result<String, String> {
     for dir in &user_data_dirs {
         if let Some((port, ws_path)) = read_devtools_active_port(dir) {
             // Try HTTP endpoint first (pre-M144)
-            if let Ok(ws_url) = discover_cdp_url("127.0.0.1", port).await {
+            if let Ok(ws_url) = discover_cdp_url("127.0.0.1", port, None).await {
                 return Ok(ws_url);
             }
             // M144+: direct WebSocket — verify the port is actually listening
@@ -517,7 +548,7 @@ pub async fn auto_connect_cdp() -> Result<String, String> {
 
     // Fallback: probe common ports
     for port in [9222u16, 9229] {
-        if let Ok(ws_url) = discover_cdp_url("127.0.0.1", port).await {
+        if let Ok(ws_url) = discover_cdp_url("127.0.0.1", port, None).await {
             return Ok(ws_url);
         }
     }
@@ -794,6 +825,8 @@ mod tests {
     fn test_chrome_launch_error_no_stderr() {
         let msg = chrome_launch_error("Chrome exited", &[]);
         assert!(msg.contains("no stderr output"));
+        assert!(msg.contains("Hint:"));
+        assert!(msg.contains("--no-sandbox"));
     }
 
     #[test]
@@ -817,8 +850,22 @@ mod tests {
 
     #[test]
     fn test_find_playwright_chromium_nonexistent() {
-        let _guard = EnvGuard::new(&["PLAYWRIGHT_BROWSERS_PATH"]);
-        _guard.set("PLAYWRIGHT_BROWSERS_PATH", "/nonexistent/path");
+        let guard = EnvGuard::new(&["PLAYWRIGHT_BROWSERS_PATH", "HOME", "USERPROFILE"]);
+        guard.set("PLAYWRIGHT_BROWSERS_PATH", "/nonexistent/path");
+
+        let temp_home = std::env::temp_dir().join(format!(
+            "agent-browser-test-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_home).expect("temp home should be created");
+        let temp_home = temp_home.to_string_lossy().to_string();
+        guard.set("HOME", &temp_home);
+        guard.set("USERPROFILE", &temp_home);
+
         let result = find_playwright_chromium();
         assert!(result.is_none());
     }
@@ -831,6 +878,10 @@ mod tests {
         };
         let result = build_chrome_args(&opts).unwrap();
         assert!(result.args.iter().any(|a| a == "--headless=new"));
+        assert!(result
+            .args
+            .iter()
+            .any(|a| a == "--enable-unsafe-swiftshader"));
         assert!(result.args.iter().any(|a| a == "--window-size=1280,720"));
         // Temp dir created when no profile
         assert!(result.temp_user_data_dir.is_some());
@@ -847,6 +898,10 @@ mod tests {
         };
         let result = build_chrome_args(&opts).unwrap();
         assert!(!result.args.iter().any(|a| a.contains("--headless")));
+        assert!(!result
+            .args
+            .iter()
+            .any(|a| a == "--enable-unsafe-swiftshader"));
         assert!(!result.args.iter().any(|a| a.starts_with("--window-size=")));
         // Temp dir created when no profile
         assert!(result.temp_user_data_dir.is_some());

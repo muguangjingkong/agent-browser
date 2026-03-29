@@ -8,6 +8,7 @@ node_modules/
 # Native binaries — platform binaries are COMMITTED for Docker/CI
 # (postinstall.js download may not run with bun or in all environments)
 # bin/agent-browser-*
+bin/.install-method
 !bin/agent-browser
 !bin/agent-browser.cmd
 
@@ -59,3 +60,7 @@ docs/package-lock.json
 # pnpm
 .pnpm-store/
 trace.json
+
+# next
+.next/
+out/

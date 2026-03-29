@@ -1,6 +1,3 @@
-import { pageMetadata } from "@/lib/page-metadata"
-export const metadata = pageMetadata("security")
-
 # Security
 
 agent-browser includes security features to protect against credential exposure, prompt injection via untrusted page content, and unauthorized browser actions.
@@ -49,6 +46,8 @@ agent-browser auth show github
 # Delete a profile
 agent-browser auth delete github
 ```
+
+`auth login` navigates with the `load` lifecycle event and then waits for form selectors to appear before filling/clicking. This makes delayed SPA login pages more reliable while avoiding `networkidle` hangs on pages with long-lived background requests.
 
 Custom selectors can be specified if auto-detection fails:
 

@@ -7,7 +7,12 @@
 //! Run serially to avoid Chrome instance contention:
 //!   cargo test e2e -- --ignored --test-threads=1
 
+use base64::{engine::general_purpose::STANDARD, Engine};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::test_utils::EnvGuard;
 
 use super::actions::{execute_command, DaemonState};
 
@@ -22,6 +27,22 @@ fn assert_success(resp: &Value) {
 
 fn get_data(resp: &Value) -> &Value {
     resp.get("data").expect("Missing 'data' in response")
+}
+
+fn native_test_fixture_html(name: &str) -> &'static str {
+    match name {
+        "drag_probe" => include_str!("test_fixtures/drag_probe.html"),
+        "html5_drag_probe" => include_str!("test_fixtures/html5_drag_probe.html"),
+        "pointer_capture_probe" => include_str!("test_fixtures/pointer_capture_probe.html"),
+        _ => panic!("Unknown native test fixture: {}", name),
+    }
+}
+
+fn native_test_fixture_url(name: &str) -> String {
+    format!(
+        "data:text/html;base64,{}",
+        STANDARD.encode(native_test_fixture_html(name))
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +191,127 @@ async fn e2e_lightpanda_auto_launch_can_open_page() {
     let resp = execute_command(&json!({ "id": "2", "action": "close" }), &mut state).await;
     assert_success(&resp);
     assert_eq!(get_data(&resp)["closed"], true);
+}
+
+// ---------------------------------------------------------------------------
+// Runtime stream lifecycle
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn e2e_runtime_stream_enable_before_launch_attaches_and_disables() {
+    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let socket_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-stream-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+    guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.to_str().expect("socket dir should be utf-8"),
+    );
+    guard.set("AGENT_BROWSER_SESSION", "e2e-runtime-stream");
+
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(&json!({ "id": "1", "action": "stream_status" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["enabled"], false);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "stream_enable", "port": 0 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let port = get_data(&resp)["port"]
+        .as_u64()
+        .expect("stream enable should report the bound port");
+    assert_eq!(get_data(&resp)["connected"], false);
+
+    let stream_path = socket_dir.join("e2e-runtime-stream.stream");
+    assert!(
+        stream_path.exists(),
+        "runtime enable should create .stream metadata"
+    );
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("websocket client should connect to runtime stream");
+
+    let initial = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("websocket should emit initial status")
+        .expect("websocket should stay open")
+        .expect("websocket message should be valid");
+    let initial_text = initial.into_text().expect("initial message should be text");
+    let initial_status: Value =
+        serde_json::from_str(&initial_text).expect("status JSON should parse");
+    assert_eq!(initial_status["type"], "status");
+    assert_eq!(initial_status["connected"], false);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "navigate", "url": "data:text/html,<h1>Runtime Stream</h1>" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let mut observed_connected = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let Some(message) = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws.next())
+            .await
+            .expect("websocket should emit status after browser launch")
+        else {
+            continue;
+        };
+        let message = message.expect("websocket message should be valid");
+        if !message.is_text() {
+            continue;
+        }
+        let parsed: Value =
+            serde_json::from_str(message.to_text().expect("text message should be readable"))
+                .expect("runtime stream payload should be valid JSON");
+        if parsed.get("type") == Some(&json!("status"))
+            && parsed.get("connected") == Some(&json!(true))
+        {
+            observed_connected = true;
+            break;
+        }
+    }
+    assert!(
+        observed_connected,
+        "runtime stream should report connected=true after browser launch"
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "stream_disable" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["disabled"], true);
+    assert!(
+        !stream_path.exists(),
+        "stream disable should remove .stream metadata"
+    );
+
+    let close_message = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("websocket should close after disable");
+    assert!(
+        close_message.is_none() || close_message.expect("ws result should exist").is_ok(),
+        "websocket should shut down cleanly when the runtime stream is disabled"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    let _ = std::fs::remove_dir_all(&socket_dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -932,6 +1074,88 @@ async fn e2e_wait() {
 }
 
 // ---------------------------------------------------------------------------
+// Same-document navigation regression test
+// ---------------------------------------------------------------------------
+//
+// Chrome may perform a same-document navigation when it determines the target
+// URL is the same document as the current page (ignoring fragment). This
+// causes Page.loadEventFired to not fire, making wait_for_lifecycle
+// hang forever waiting for an event that never comes.
+//
+// The fix checks loader_id in the Page.navigate response - if None,
+// it's a same-document navigation and we skip waiting for lifecycle events.
+
+#[tokio::test]
+#[ignore]
+async fn e2e_navigate_same_url_twice_should_not_hang() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate to about:blank first to start from a known state
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": "about:blank" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Create a simple HTML page that changes its own URL via history.pushState
+    // This simulates SPA routing behavior which triggers same-document navigation
+    let base_page = "data:text/html,<html><body><script>
+        // On first load, change URL via pushState without navigation
+        history.pushState({}, '', '/#/home');
+    </script><h1>Test</h1></body></html>";
+
+    // Navigate to the page (first time)
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "navigate", "url": base_page }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Verify URL changed due to pushState
+    let resp = execute_command(&json!({ "id": "4", "action": "url" }), &mut state).await;
+    assert_success(&resp);
+    let url_after_push = get_data(&resp)["url"].as_str().unwrap();
+    // URL should have changed to include /#/home due to pushState
+    assert!(
+        url_after_push.contains("/%23/home") || url_after_push.contains("/#/home"),
+        "URL should have changed via pushState, got: {}",
+        url_after_push
+    );
+
+    // Navigate to the SAME base URL again
+    // Without fix: Chrome may do same-document nav, wait_for_lifecycle hangs
+    // With fix: We detect loader_id is None and skip waiting
+    let start = std::time::Instant::now();
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "navigate", "url": base_page }),
+        &mut state,
+    )
+    .await;
+    let elapsed = start.elapsed().as_secs();
+
+    // Should complete quickly (< 5 seconds) without hanging
+    // Without fix, this times out after 25 seconds (default_timeout_ms)
+    assert!(
+        elapsed < 5,
+        "Second navigation should not hang, but took {}s",
+        elapsed
+    );
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+// ---------------------------------------------------------------------------
 // Viewport with deviceScaleFactor (retina)
 // ---------------------------------------------------------------------------
 
@@ -1153,6 +1377,245 @@ async fn e2e_hover_scroll_press() {
 }
 
 // ---------------------------------------------------------------------------
+// Raw mouse regressions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn e2e_mouse_down_move_up_preserves_drag_state() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": native_test_fixture_url("drag_probe")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "evaluate",
+            "script": r#"(() => {
+                const rect = document.getElementById('target').getBoundingClientRect();
+                return {
+                    left: Math.round(rect.left),
+                    top: Math.round(rect.top),
+                    x: Math.round(rect.left + rect.width / 2),
+                    y: Math.round(rect.top + rect.height / 2)
+                };
+            })()"#
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let start = &get_data(&resp)["result"];
+    let initial_left = start["left"]
+        .as_i64()
+        .expect("target left should be numeric");
+    let initial_top = start["top"].as_i64().expect("target top should be numeric");
+    let start_x = start["x"].as_i64().expect("target x should be numeric");
+    let start_y = start["y"].as_i64().expect("target y should be numeric");
+    let end_x = start_x + 80;
+    let end_y = start_y + 60;
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "mousemove", "x": start_x, "y": start_y }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "mousedown", "button": "left" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "mousemove", "x": end_x, "y": end_y }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "mouseup", "button": "left" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "evaluate", "script": "window.__dragProbe" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let probe = &get_data(&resp)["result"];
+    assert_eq!(probe["finalLeft"].as_i64(), Some(initial_left + 80));
+    assert_eq!(probe["finalTop"].as_i64(), Some(initial_top + 60));
+
+    let events = probe["events"]
+        .as_array()
+        .expect("drag probe should expose events");
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "mousedown"
+                && event["x"].as_f64() == Some(start_x as f64)
+                && event["y"].as_f64() == Some(start_y as f64)
+                && event["buttons"].as_i64() == Some(1)
+        }),
+        "Expected a non-zero mousedown event in drag probe"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "mousemove"
+                && event["x"].as_f64() == Some(end_x as f64)
+                && event["y"].as_f64() == Some(end_y as f64)
+                && event["buttons"].as_i64() == Some(1)
+        }),
+        "Expected a drag mousemove with the button still pressed"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "mouseup"
+                && event["x"].as_f64() == Some(end_x as f64)
+                && event["y"].as_f64() == Some(end_y as f64)
+                && event["buttons"].as_i64() == Some(0)
+        }),
+        "Expected mouseup at the last drag position"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_mouse_drag_reaches_pointer_capture_target() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": native_test_fixture_url("pointer_capture_probe")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "evaluate",
+            "script": r#"(() => {
+                const rect = document.getElementById('handle').getBoundingClientRect();
+                return {
+                    x: Math.round(rect.left + rect.width / 2),
+                    y: Math.round(rect.top + rect.height / 2)
+                };
+            })()"#
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let start = &get_data(&resp)["result"];
+    let start_x = start["x"].as_i64().expect("handle x should be numeric");
+    let start_y = start["y"].as_i64().expect("handle y should be numeric");
+    let end_x = start_x + 80;
+    let end_y = start_y + 60;
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "mousemove", "x": start_x, "y": start_y }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "mousedown", "button": "left" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "mousemove", "x": end_x, "y": end_y }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "mouseup", "button": "left" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "evaluate", "script": "window.__pointerCaptureProbe" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let probe = &get_data(&resp)["result"];
+    assert_eq!(probe["moved"].as_bool(), Some(true));
+
+    let events = probe["events"]
+        .as_array()
+        .expect("pointer capture probe should expose events");
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "pointermove"
+                && event["phase"] == "drag"
+                && event["hasCapture"].as_bool() == Some(true)
+                && event["x"].as_f64() == Some(end_x as f64)
+                && event["y"].as_f64() == Some(end_y as f64)
+        }),
+        "Expected pointermove with capture during the drag"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "pointerup"
+                && event["phase"] == "up"
+                && event["hadCapture"].as_bool() == Some(true)
+        }),
+        "Expected pointerup to observe an active pointer capture"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+// ---------------------------------------------------------------------------
 // State save/load, state management
 // ---------------------------------------------------------------------------
 
@@ -1219,6 +1682,142 @@ async fn e2e_state_management() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-domain state save (issue #1060)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn e2e_save_state_cross_domain() {
+    let mut state = DaemonState::new();
+
+    // Launch
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate to domain A and set cookie + localStorage
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": "https://httpbin.org/html" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "cookies_set",
+            "name": "domainA_cookie", "value": "from_httpbin"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "4", "action": "storage_set",
+            "type": "local", "key": "domainA_key", "value": "domainA_val"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate to domain B and set cookie + localStorage
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "navigate", "url": "https://example.com" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "6", "action": "cookies_set",
+            "name": "domainB_cookie", "value": "from_example"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "7", "action": "storage_set",
+            "type": "local", "key": "domainB_key", "value": "domainB_val"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Save state (currently on example.com)
+    let tmp_state = std::env::temp_dir()
+        .join("agent-browser-e2e-cross-domain-state.json")
+        .to_string_lossy()
+        .to_string();
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "state_save", "path": &tmp_state }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Read and verify saved state
+    let saved = std::fs::read_to_string(&tmp_state).expect("State file should exist");
+    let state_data: serde_json::Value = serde_json::from_str(&saved).unwrap();
+
+    // Verify BOTH domain cookies are present
+    let cookies = state_data["cookies"].as_array().unwrap();
+    let has_domain_a = cookies.iter().any(|c| c["name"] == "domainA_cookie");
+    let has_domain_b = cookies.iter().any(|c| c["name"] == "domainB_cookie");
+    assert!(
+        has_domain_a,
+        "Should include cross-domain cookie from httpbin.org: {:?}",
+        cookies
+    );
+    assert!(
+        has_domain_b,
+        "Should include cookie from example.com: {:?}",
+        cookies
+    );
+
+    // Verify BOTH origins' localStorage are present
+    let origins = state_data["origins"].as_array().unwrap();
+    let has_origin_a = origins.iter().any(|o| {
+        o["origin"].as_str().is_some_and(|s| s.contains("httpbin"))
+            && o["localStorage"]
+                .as_array()
+                .is_some_and(|ls| ls.iter().any(|e| e["name"] == "domainA_key"))
+    });
+    let has_origin_b = origins.iter().any(|o| {
+        o["origin"].as_str().is_some_and(|s| s.contains("example"))
+            && o["localStorage"]
+                .as_array()
+                .is_some_and(|ls| ls.iter().any(|e| e["name"] == "domainB_key"))
+    });
+    assert!(
+        has_origin_a,
+        "Should include localStorage from httpbin.org origin: {:?}",
+        origins
+    );
+    assert!(
+        has_origin_b,
+        "Should include localStorage from example.com origin: {:?}",
+        origins
+    );
+
+    // Clean up
+    let _ = std::fs::remove_file(&tmp_state);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+// ---------------------------------------------------------------------------
 // Domain filter
 // ---------------------------------------------------------------------------
 
@@ -1227,15 +1826,19 @@ async fn e2e_state_management() {
 async fn e2e_domain_filter() {
     let mut state = DaemonState::new();
 
+    // Set domain filter BEFORE launch so Fetch.enable is called during
+    // launch and the background fetch handler intercepts from the start.
+    {
+        let mut df = state.domain_filter.write().await;
+        *df = Some(super::network::DomainFilter::new("example.com"));
+    }
+
     let resp = execute_command(
         &json!({ "id": "1", "action": "launch", "headless": true }),
         &mut state,
     )
     .await;
     assert_success(&resp);
-
-    // Set domain filter after launch to avoid Fetch.enable deadlock in tests.
-    state.domain_filter = Some(super::network::DomainFilter::new("example.com"));
 
     // Allowed domain
     let resp = execute_command(
@@ -1257,6 +1860,34 @@ async fn e2e_domain_filter() {
         error.contains("blocked") || error.contains("not allowed"),
         "Should reject blocked domain, got: {}",
         error
+    );
+
+    // Verify that in-page fetch to a blocked domain is also blocked by
+    // the Fetch interception layer (not just the navigate-level check).
+    // First navigate to the allowed domain.
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "navigate", "url": "https://example.com" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Attempt a cross-origin fetch to a blocked domain from the page.
+    let resp = execute_command(
+        &json!({
+            "id": "5", "action": "evaluate",
+            "script": "fetch('https://blocked.com/data').then(() => 'ok').catch(e => 'blocked:' + e.message)",
+            "await": true,
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let result = get_data(&resp)["result"].as_str().unwrap_or("");
+    assert!(
+        result.starts_with("blocked:"),
+        "Fetch to blocked domain should fail, got: {}",
+        result,
     );
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
@@ -1985,12 +2616,12 @@ async fn e2e_material_checkbox_check_uncheck() {
 
 // ---------------------------------------------------------------------------
 // Issue #841 – snapshot -C and screenshot --annotate must not hang over WSS
+// (PS: -C is deprecated, cursor-interactive elements are referred by default now)
 // ---------------------------------------------------------------------------
 
-/// Verifies that `snapshot -C` (cursor-interactive mode) detects elements with
-/// cursor:pointer / onclick / tabindex, produces the correct v0.19.0-compatible
-/// output format, deduplicates against the ARIA tree, and completes in bounded
-/// time (no sequential CDP round-trip explosion).
+/// Verifies that `snapshot` detects elements with cursor:pointer / onclick / tabindex,
+/// produces the correct v0.19.0-compatible output format, deduplicates against the ARIA
+/// tree, and completes in bounded time (no sequential CDP round-trip explosion).
 #[tokio::test]
 #[ignore]
 async fn e2e_snapshot_cursor_interactive() {
@@ -2004,7 +2635,7 @@ async fn e2e_snapshot_cursor_interactive() {
     assert_success(&resp);
 
     // Page with:
-    //  - <button> and <a> (standard interactive – ARIA tree, NOT in cursor section)
+    //  - <button> and <a> (standard interactive – ARIA tree)
     //  - <div cursor:pointer onclick> (clickable – cursor section)
     //  - <div tabindex=0> (focusable – cursor section)
     //  - <span cursor:pointer> (clickable – cursor section)
@@ -2027,10 +2658,10 @@ async fn e2e_snapshot_cursor_interactive() {
     .await;
     assert_success(&resp);
 
-    // snapshot -i -C: interactive tree + cursor section
+    // snapshot -i: interactive tree
     let start = std::time::Instant::now();
     let resp = execute_command(
-        &json!({ "id": "3", "action": "snapshot", "interactive": true, "cursor": true }),
+        &json!({ "id": "3", "action": "snapshot", "interactive": true }),
         &mut state,
     )
     .await;
@@ -2077,7 +2708,7 @@ async fn e2e_snapshot_cursor_interactive() {
     // Must complete quickly (< 5s), not hit the 30s CDP timeout
     assert!(
         elapsed.as_secs() < 5,
-        "snapshot -C took {:?}, expected < 5s (Issue #841 regression)",
+        "snapshot took {:?}, expected < 5s (Issue #841 regression)",
         elapsed,
     );
 
@@ -2144,7 +2775,7 @@ async fn e2e_screenshot_annotate_many_elements() {
     assert_success(&resp);
 }
 
-/// Verifies `snapshot -C` with many cursor-interactive elements completes in
+/// Verifies `snapshot` with many cursor-interactive elements completes in
 /// bounded time. Direct regression test for Issue #841's root cause: N×2
 /// sequential CDP round-trips per cursor-interactive element.
 #[tokio::test]
@@ -2179,7 +2810,7 @@ async fn e2e_snapshot_cursor_many_elements() {
 
     let start = std::time::Instant::now();
     let resp = execute_command(
-        &json!({ "id": "3", "action": "snapshot", "interactive": true, "cursor": true }),
+        &json!({ "id": "3", "action": "snapshot", "interactive": true }),
         &mut state,
     )
     .await;
@@ -2203,8 +2834,922 @@ async fn e2e_snapshot_cursor_many_elements() {
     // Must complete quickly
     assert!(
         elapsed.as_secs() < 10,
-        "snapshot -C with 100 cursor elements took {:?}, expected < 10s (Issue #841)",
+        "snapshot with 100 cursor elements took {:?}, expected < 10s (Issue #841)",
         elapsed,
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Test that InlineTextBox nodes are filtered from snapshot output while preserving
+/// the actual text content from parent elements.
+#[tokio::test]
+#[ignore]
+async fn e2e_snapshot_continuous_static_text() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Simple HTML with text content that would generate InlineTextBox nodes and sperate to multiple StaticText nodes
+    let html =
+        "data:text/html,<html><body><div><span>Hello</span> <span>World</span></div></body></html>";
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": html }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Take snapshot to capture full output and verify InlineTextBox filtering and StaticText aggregation
+    let start = std::time::Instant::now();
+    let resp = execute_command(&json!({ "id": "3", "action": "snapshot" }), &mut state).await;
+    assert_success(&resp);
+    let elapsed = start.elapsed();
+
+    let snapshot_output = get_data(&resp)["snapshot"].as_str().unwrap();
+
+    // Verify that InlineTextBox does not appear in the output
+    assert!(
+        !snapshot_output.contains("InlineTextBox"),
+        "Snapshot output should not contain InlineTextBox: {}",
+        snapshot_output
+    );
+
+    // Verify that the actual text content is preserved
+    assert!(
+        snapshot_output.contains("Hello World"),
+        "Snapshot should contain 'Hello World': {}",
+        snapshot_output
+    );
+
+    // Must complete quickly
+    assert!(
+        elapsed.as_secs() < 5,
+        "snapshot with InlineTextBox filtering took {:?}, expected < 5s",
+        elapsed,
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: tiny HTTP server that echoes request headers as JSON
+// ---------------------------------------------------------------------------
+
+/// Starts a TCP listener on localhost:0 and spawns a task that accepts
+/// connections, reads the HTTP request, and responds with a JSON body
+/// containing all received request headers. Returns the server's base URL.
+async fn start_echo_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    let handle = tokio::spawn(async move {
+        // Serve up to 20 requests then exit (enough for all tests).
+        for _ in 0..20 {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+
+                // Parse headers from the HTTP request.
+                let mut headers = serde_json::Map::new();
+                for line in request.lines().skip(1) {
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(": ") {
+                        headers.insert(key.to_string(), Value::String(value.to_string()));
+                    }
+                }
+
+                let body = serde_json::to_string(&json!({ "headers": headers })).unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (base_url, handle)
+}
+
+/// Starts a tiny HTTP server that serves a delayed-render login form.
+///
+/// The page continuously fetches `/ping` so `networkidle` is hard to reach,
+/// while the login form itself appears after `render_delay_ms`.
+async fn start_delayed_login_server(
+    render_delay_ms: u64,
+    ping_interval_ms: u64,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    let handle = tokio::spawn(async move {
+        // Serve enough requests for navigation + many background /ping calls.
+        for _ in 0..1000 {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let request_line = request.lines().next().unwrap_or_default();
+                let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+
+                let (status, content_type, body) = if path.starts_with("/ping") {
+                    ("204 No Content", "text/plain", String::new())
+                } else {
+                    let html = format!(
+                        r#"<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Delayed Login</title></head>
+  <body>
+    <input id="search" type="text" name="search" />
+    <div id="root">loading...</div>
+    <script>
+      setInterval(() => {{
+        fetch('/ping?ts=' + Date.now()).catch(() => {{}});
+      }}, {ping_interval_ms});
+
+      setTimeout(() => {{
+        const root = document.getElementById('root');
+        root.innerHTML = `
+          <form id="login-form" onsubmit="event.preventDefault(); window.__submitted = true;">
+            <input type="email" name="email" />
+            <input type="password" name="password" />
+            <button type="submit">Sign in</button>
+          </form>
+        `;
+      }}, {render_delay_ms});
+    </script>
+  </body>
+</html>"#,
+                    );
+                    ("200 OK", "text/html", html)
+                };
+
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: {}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    content_type,
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (base_url, handle)
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_auth_login_waits_for_delayed_spa_form_render() {
+    let (base_url, _server) = start_delayed_login_server(1200, 100).await;
+    let mut state = DaemonState::new();
+
+    let profile_name = format!(
+        "e2e-auth-login-spa-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+            .as_millis()
+    );
+
+    let launch = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&launch);
+
+    let save = execute_command(
+        &json!({
+            "id": "2",
+            "action": "auth_save",
+            "name": profile_name.clone(),
+            "url": format!("{}/login", base_url),
+            "username": "user@example.com",
+            "password": "super-secret",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&save);
+
+    let login = execute_command(
+        &json!({ "id": "3", "action": "auth_login", "name": profile_name.clone() }),
+        &mut state,
+    )
+    .await;
+    assert_success(&login);
+    assert_eq!(get_data(&login)["loggedIn"], true);
+
+    let verify = execute_command(
+        &json!({
+            "id": "4",
+            "action": "evaluate",
+            "script": "({ user: document.querySelector('input[type=email]')?.value ?? '', pass: document.querySelector('input[type=password]')?.value ?? '', search: document.querySelector('#search')?.value ?? '', submitted: !!window.__submitted })",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&verify);
+    let result = &get_data(&verify)["result"];
+    assert_eq!(result["user"], "user@example.com");
+    assert_eq!(result["pass"], "super-secret");
+    assert_eq!(result["search"], "");
+    assert_eq!(result["submitted"], true);
+
+    let _ = execute_command(
+        &json!({ "id": "5", "action": "auth_delete", "name": profile_name }),
+        &mut state,
+    )
+    .await;
+
+    let close = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&close);
+}
+
+// ---------------------------------------------------------------------------
+// Origin-scoped --headers tests
+// ---------------------------------------------------------------------------
+
+/// Headers passed via --headers on open persist for subsequent same-origin
+/// navigations (the core regression from the Rust rewrite).
+#[tokio::test]
+#[ignore]
+async fn e2e_headers_persist_same_origin_navigation() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate with --headers.
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "navigate",
+            "url": format!("{}/first", base_url),
+            "headers": { "X-Test": "scoped" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate to the same origin WITHOUT --headers.
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "navigate",
+            "url": format!("{}/second", base_url),
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // The page body is the echo JSON. Read it via evaluate.
+    let resp = execute_command(
+        &json!({
+            "id": "4", "action": "evaluate",
+            "script": "JSON.parse(document.body.innerText)",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let result = &get_data(&resp)["result"];
+    assert_eq!(
+        result["headers"]["X-Test"], "scoped",
+        "X-Test header should persist on same-origin navigation without --headers"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Headers passed via --headers on open persist for in-page fetch/XHR to
+/// the same origin.
+#[tokio::test]
+#[ignore]
+async fn e2e_headers_persist_same_origin_fetch() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate with --headers.
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "navigate",
+            "url": format!("{}/page", base_url),
+            "headers": { "X-Test": "fetched" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // In-page fetch to the same origin (relative URL).
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "evaluate",
+            "script": "fetch('/echo').then(r => r.json())",
+            "await": true,
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let result = &get_data(&resp)["result"];
+    assert_eq!(
+        result["headers"]["X-Test"], "fetched",
+        "X-Test header should be present on in-page fetch to same origin"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Headers set via --headers do NOT leak to a different origin.
+#[tokio::test]
+#[ignore]
+async fn e2e_headers_do_not_leak_cross_origin() {
+    let (server_a, _ha) = start_echo_server().await;
+    let (server_b, _hb) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate to server A with --headers.
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "navigate",
+            "url": format!("{}/page", server_a),
+            "headers": { "X-Secret": "a-only" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate to server B (different origin) without --headers.
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "navigate",
+            "url": format!("{}/page", server_b),
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "4", "action": "evaluate",
+            "script": "JSON.parse(document.body.innerText)",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let result = &get_data(&resp)["result"];
+    assert!(
+        result["headers"].get("X-Secret").is_none(),
+        "X-Secret header must NOT leak to a different origin, got: {}",
+        result["headers"],
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// In-page fetch to a cross-origin URL must NOT include the origin-scoped
+/// headers (sub-resource isolation).
+#[tokio::test]
+#[ignore]
+async fn e2e_headers_do_not_leak_cross_origin_fetch() {
+    let (server_a, _ha) = start_echo_server().await;
+    let (server_b, _hb) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate to server A with --headers.
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "navigate",
+            "url": format!("{}/page", server_a),
+            "headers": { "X-Secret": "a-only" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Fetch from the page to server B (cross-origin sub-resource).
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "evaluate",
+            "script": format!("fetch('{}/echo').then(r => r.json())", server_b),
+            "await": true,
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let result = &get_data(&resp)["result"];
+    assert!(
+        result["headers"].get("X-Secret").is_none(),
+        "X-Secret header must NOT leak to cross-origin fetch, got: {}",
+        result["headers"],
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// `set headers` (global headers via the headers action) must not be
+/// regressed — they should persist across navigations without being
+/// cleared by the origin-scoped header logic.
+#[tokio::test]
+#[ignore]
+async fn e2e_set_headers_not_regressed() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Set global headers via the `headers` action (not --headers on navigate).
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "headers",
+            "headers": { "X-Global": "everywhere" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate — global headers should be present.
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "navigate",
+            "url": format!("{}/page", base_url),
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "4", "action": "evaluate",
+            "script": "JSON.parse(document.body.innerText)",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let result = &get_data(&resp)["result"];
+    assert_eq!(
+        result["headers"]["X-Global"], "everywhere",
+        "Global headers set via `set headers` must persist across navigations"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Multiple origins each get their own independent headers.
+#[tokio::test]
+#[ignore]
+async fn e2e_headers_multiple_origins_independent() {
+    let (server_a, _ha) = start_echo_server().await;
+    let (server_b, _hb) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Set headers for origin A.
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "navigate",
+            "url": format!("{}/page", server_a),
+            "headers": { "X-From": "alpha" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Set different headers for origin B.
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "navigate",
+            "url": format!("{}/page", server_b),
+            "headers": { "X-From": "beta" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Verify B got its own header.
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "evaluate", "script": "JSON.parse(document.body.innerText)" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"]["headers"]["X-From"], "beta");
+
+    // Navigate back to A — should get A's header, not B's.
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "navigate", "url": format!("{}/check", server_a) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "evaluate", "script": "JSON.parse(document.body.innerText)" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"]["headers"]["X-From"], "alpha");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Headers persist when navigating away to a different origin and back.
+#[tokio::test]
+#[ignore]
+async fn e2e_headers_persist_after_roundtrip() {
+    let (server_a, _ha) = start_echo_server().await;
+    let (server_b, _hb) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Set headers for origin A.
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "navigate",
+            "url": format!("{}/page", server_a),
+            "headers": { "X-Persist": "roundtrip" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate away to B (no headers).
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "navigate", "url": format!("{}/page", server_b) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Navigate back to A without --headers.
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "navigate", "url": format!("{}/back", server_a) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "evaluate", "script": "JSON.parse(document.body.innerText)" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["result"]["headers"]["X-Persist"],
+        "roundtrip",
+        "Headers should persist after navigating away and back to the same origin"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Passing --headers a second time to the same origin replaces the previous headers.
+#[tokio::test]
+#[ignore]
+async fn e2e_headers_override_same_origin() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Set initial headers.
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "navigate",
+            "url": format!("{}/first", base_url),
+            "headers": { "X-Version": "v1" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Override with new headers.
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "navigate",
+            "url": format!("{}/second", base_url),
+            "headers": { "X-Version": "v2" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "evaluate", "script": "JSON.parse(document.body.innerText)" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["result"]["headers"]["X-Version"],
+        "v2",
+        "Second --headers should replace the first for the same origin"
+    );
+
+    // Subsequent navigation without --headers should use v2.
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "navigate", "url": format!("{}/third", base_url) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "evaluate", "script": "JSON.parse(document.body.innerText)" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"]["headers"]["X-Version"], "v2");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// `set headers` (global) and `--headers` (origin-scoped) stack together.
+#[tokio::test]
+#[ignore]
+async fn e2e_global_and_scoped_headers_stack() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Set global headers via `set headers`.
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "headers",
+            "headers": { "X-Global": "everywhere" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Set origin-scoped headers via --headers.
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "navigate",
+            "url": format!("{}/page", base_url),
+            "headers": { "X-Scoped": "this-origin" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "evaluate", "script": "JSON.parse(document.body.innerText)" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let headers = &get_data(&resp)["result"]["headers"];
+    assert_eq!(
+        headers["X-Global"], "everywhere",
+        "Global header should be present alongside scoped header"
+    );
+    assert_eq!(
+        headers["X-Scoped"], "this-origin",
+        "Scoped header should be present alongside global header"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Origin-scoped headers with different casing than the browser's original
+/// request headers must not produce duplicates (HTTP headers are
+/// case-insensitive per RFC 7230).
+#[tokio::test]
+#[ignore]
+async fn e2e_headers_case_insensitive_no_duplicates() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Chrome sends "Accept: ..." by default on navigations. Pass "accept"
+    // (lowercase) via --headers to verify the merge is case-insensitive
+    // and doesn't produce a duplicate Accept header.
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "navigate",
+            "url": format!("{}/page", base_url),
+            "headers": { "accept": "application/test" },
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "evaluate",
+            "script": "JSON.parse(document.body.innerText)",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let result = &get_data(&resp)["result"]["headers"];
+
+    // The echo server stores headers keyed by name as received on the wire.
+    // If deduplication works, only our custom "accept" value should appear
+    // (Chrome's original "Accept: text/html,..." should be suppressed).
+    let accept_val = result
+        .get("accept")
+        .or_else(|| result.get("Accept"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        accept_val, "application/test",
+        "Case-insensitive merge should replace Chrome's Accept header, got headers: {}",
+        result,
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+// ---------------------------------------------------------------------------
+// Regression: externally opened tabs must appear in tab_list (#1037)
+//
+// When connected to Chrome (launched or via --cdp), a tab opened outside of
+// agent-browser (e.g. by the user or another CDP client) should be detected
+// and listed. Previously, chrome://newtab/ was filtered by
+// is_internal_chrome_target, and Target.targetInfoChanged for untracked
+// targets was silently ignored.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn e2e_externally_opened_tab_detected() {
+    let mut state = DaemonState::new();
+
+    // Launch headless Chrome
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Verify initial tab count
+    let resp = execute_command(&json!({ "id": "2", "action": "tab_list" }), &mut state).await;
+    assert_success(&resp);
+    let initial_count = get_data(&resp)["tabs"].as_array().unwrap().len();
+
+    // Simulate an external client opening a new tab via the browser-level CDP
+    // session (no sessionId). This mirrors what happens when a user manually
+    // opens a tab while agent-browser is connected via --cdp.
+    let browser = state.browser.as_ref().expect("browser should be launched");
+    let _: Value = browser
+        .client
+        .send_command(
+            "Target.createTarget",
+            Some(json!({ "url": "data:text/html,<h1>External Tab</h1>" })),
+            None, // browser-level session
+        )
+        .await
+        .expect("Target.createTarget should succeed");
+
+    // Give Chrome a moment to fire targetCreated / targetInfoChanged events
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Drain events by issuing tab_list — this triggers execute_command's
+    // drain_cdp_events path which processes new and changed targets.
+    let resp = execute_command(&json!({ "id": "3", "action": "tab_list" }), &mut state).await;
+    assert_success(&resp);
+    let tabs = get_data(&resp)["tabs"].as_array().unwrap();
+
+    assert_eq!(
+        tabs.len(),
+        initial_count + 1,
+        "Externally opened tab should appear in tab_list, got: {:?}",
+        tabs,
+    );
+
+    // Verify the new tab's URL is the data URL we navigated to
+    let new_tab = tabs.iter().find(|t| {
+        t["url"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("data:text/html"))
+    });
+    assert!(
+        new_tab.is_some(),
+        "Should find the externally opened tab by URL, tabs: {:?}",
+        tabs,
     );
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;

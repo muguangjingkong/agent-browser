@@ -95,6 +95,21 @@ fn is_internal_chrome_target(url: &str) -> bool {
         || url.starts_with("devtools://")
 }
 
+pub(crate) fn should_track_target(target: &TargetInfo) -> bool {
+    (target.target_type == "page" || target.target_type == "webview")
+        && (target.url.is_empty() || !is_internal_chrome_target(&target.url))
+}
+
+fn update_page_target_info_in_pages(pages: &mut [PageInfo], target: &TargetInfo) -> bool {
+    if let Some(page) = pages.iter_mut().find(|p| p.target_id == target.target_id) {
+        page.url = target.url.clone();
+        page.title = target.title.clone();
+        page.target_type = target.target_type.clone();
+        return true;
+    }
+    false
+}
+
 /// Converts common error messages into AI-friendly, actionable descriptions.
 pub fn to_ai_friendly_error(error: &str) -> String {
     let lower = error.to_lowercase();
@@ -129,7 +144,7 @@ pub struct PageInfo {
     pub target_type: String, // "page" or "webview"
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitUntil {
     Load,
     DomContentLoaded,
@@ -165,6 +180,14 @@ impl BrowserProcess {
             BrowserProcess::Lightpanda(p) => p.kill(),
         }
     }
+
+    /// Non-blocking check whether the browser process has exited.
+    pub fn has_exited(&mut self) -> bool {
+        match self {
+            BrowserProcess::Chrome(p) => p.has_exited(),
+            BrowserProcess::Lightpanda(_) => false,
+        }
+    }
 }
 
 pub struct BrowserManager {
@@ -174,6 +197,10 @@ pub struct BrowserManager {
     pages: Vec<PageInfo>,
     active_page_index: usize,
     default_timeout_ms: u64,
+    /// Stored download path from launch options, re-applied to new contexts (e.g., recording)
+    pub download_path: Option<String>,
+    /// Origins visited during this session, used by save_state to collect cross-origin localStorage.
+    visited_origins: HashSet<String>,
 }
 
 const LIGHTPANDA_CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -242,6 +269,8 @@ impl BrowserManager {
                 pages: Vec::new(),
                 active_page_index: 0,
                 default_timeout_ms: 25_000,
+                download_path: download_path.clone(),
+                visited_origins: HashSet::new(),
             };
             manager.discover_and_attach_targets().await?;
             manager
@@ -306,6 +335,8 @@ impl BrowserManager {
             pages: Vec::new(),
             active_page_index: 0,
             default_timeout_ms: 10_000,
+            download_path: None, // CDP connections don't have a launch-time download path
+            visited_origins: HashSet::new(),
         };
 
         manager.discover_and_attach_targets().await?;
@@ -334,11 +365,7 @@ impl BrowserManager {
         let page_targets: Vec<TargetInfo> = result
             .target_infos
             .into_iter()
-            .filter(|t| {
-                (t.target_type == "page" || t.target_type == "webview")
-                    && !t.url.is_empty()
-                    && !is_internal_chrome_target(&t.url)
-            })
+            .filter(should_track_target)
             .collect();
 
         if page_targets.is_empty() {
@@ -420,6 +447,21 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Network.enable", Some(session_id))
             .await?;
+        // Enable auto-attach for cross-origin iframe support.
+        // flatten: true gives each iframe its own session_id.
+        // Ignored on engines that don't support it (e.g. Lightpanda).
+        let _ = self
+            .client
+            .send_command(
+                "Target.setAutoAttach",
+                Some(json!({
+                    "autoAttach": true,
+                    "waitForDebuggerOnStart": false,
+                    "flatten": true
+                })),
+                Some(session_id),
+            )
+            .await;
         Ok(())
     }
 
@@ -450,11 +492,24 @@ impl BrowserManager {
             return Err(format!("Navigation failed: {}", error_text));
         }
 
-        self.wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx)
-            .await?;
+        // Only wait for lifecycle events if Chrome created a new loader (full navigation).
+        // If loader_id is None, it was a same-document navigation (e.g., hash routing)
+        // which does not fire Page.loadEventFired or Page.domContentEventFired.
+        if nav_result.loader_id.is_some() {
+            self.wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx)
+                .await?;
+        }
 
         let page_url = self.get_url().await.unwrap_or_else(|_| url.to_string());
         let title = self.get_title().await.unwrap_or_default();
+
+        // Track visited origin for cross-origin localStorage collection in save_state
+        if let Ok(parsed) = url::Url::parse(&page_url) {
+            let origin = parsed.origin().ascii_serialization();
+            if origin != "null" {
+                self.visited_origins.insert(origin);
+            }
+        }
 
         if let Some(page) = self.pages.get_mut(self.active_page_index) {
             page.url = page_url.clone();
@@ -592,6 +647,10 @@ impl BrowserManager {
         !self.pages.is_empty()
     }
 
+    pub fn default_timeout_ms(&self) -> u64 {
+        self.default_timeout_ms
+    }
+
     /// Checks if the CDP connection is alive by sending a simple command.
     /// Returns false if the command times out or fails.
     pub async fn is_connection_alive(&self) -> bool {
@@ -606,6 +665,17 @@ impl BrowserManager {
         match result {
             Ok(Ok(_)) => true,
             Ok(Err(_)) | Err(_) => false,
+        }
+    }
+
+    /// Non-blocking check whether the locally-launched browser process has exited
+    /// (crashed or terminated). Also reaps the zombie if it has exited.
+    /// Returns false for external CDP connections (no child process to monitor).
+    pub fn has_process_exited(&mut self) -> bool {
+        if let Some(ref mut process) = self.browser_process {
+            process.has_exited()
+        } else {
+            false
         }
     }
 
@@ -1053,6 +1123,10 @@ impl BrowserManager {
         self.active_page_index = index;
     }
 
+    pub fn update_page_target_info(&mut self, target: &TargetInfo) -> bool {
+        update_page_target_info_in_pages(&mut self.pages, target)
+    }
+
     pub fn remove_page_by_target_id(&mut self, target_id: &str) {
         if let Some(pos) = self.pages.iter().position(|p| p.target_id == target_id) {
             self.pages.remove(pos);
@@ -1070,6 +1144,10 @@ impl BrowserManager {
 
     pub fn pages_list(&self) -> Vec<PageInfo> {
         self.pages.clone()
+    }
+
+    pub fn visited_origins(&self) -> &HashSet<String> {
+        &self.visited_origins
     }
 
     pub async fn set_download_behavior(&self, download_path: &str) -> Result<(), String> {
@@ -1218,6 +1296,8 @@ async fn initialize_lightpanda_manager(
             pages: Vec::new(),
             active_page_index: 0,
             default_timeout_ms: 25_000,
+            download_path: None,
+            visited_origins: HashSet::new(),
         };
 
         match discover_and_attach_lightpanda_targets(&mut manager, deadline).await {
@@ -1290,12 +1370,13 @@ async fn resolve_cdp_url(input: &str) -> Result<String, String> {
             .host_str()
             .ok_or_else(|| format!("No host in CDP URL: {}", input))?;
         let port = parsed.port().unwrap_or(9222);
-        return discover_cdp_url(host, port).await;
+        let query = parsed.query().map(|q| q.to_string());
+        return discover_cdp_url(host, port, query.as_deref()).await;
     }
 
     // Try as numeric port
     if let Ok(port) = input.parse::<u16>() {
-        return discover_cdp_url("127.0.0.1", port).await;
+        return discover_cdp_url("127.0.0.1", port, None).await;
     }
 
     Err(format!(
@@ -1308,6 +1389,57 @@ async fn resolve_cdp_url(input: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use tokio::time::sleep;
+
+    #[test]
+    fn test_should_track_popup_target_with_empty_url() {
+        let target = TargetInfo {
+            target_id: "popup-1".to_string(),
+            target_type: "page".to_string(),
+            title: String::new(),
+            url: String::new(),
+            attached: None,
+            browser_context_id: None,
+        };
+
+        assert!(should_track_target(&target));
+    }
+
+    #[test]
+    fn test_should_not_track_internal_chrome_target() {
+        let target = TargetInfo {
+            target_id: "chrome-tab".to_string(),
+            target_type: "page".to_string(),
+            title: "New Tab".to_string(),
+            url: "chrome://newtab/".to_string(),
+            attached: None,
+            browser_context_id: None,
+        };
+
+        assert!(!should_track_target(&target));
+    }
+
+    #[test]
+    fn test_update_page_target_info_in_pages_updates_existing_page() {
+        let mut pages = vec![PageInfo {
+            target_id: "popup-1".to_string(),
+            session_id: "session-1".to_string(),
+            url: String::new(),
+            title: String::new(),
+            target_type: "page".to_string(),
+        }];
+        let target = TargetInfo {
+            target_id: "popup-1".to_string(),
+            target_type: "page".to_string(),
+            title: "Popup".to_string(),
+            url: "https://example.com/popup".to_string(),
+            attached: None,
+            browser_context_id: None,
+        };
+
+        assert!(update_page_target_info_in_pages(&mut pages, &target));
+        assert_eq!(pages[0].url, "https://example.com/popup");
+        assert_eq!(pages[0].title, "Popup");
+    }
 
     #[test]
     fn test_validate_launch_options_extensions_and_cdp() {
