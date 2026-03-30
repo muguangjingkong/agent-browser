@@ -89,6 +89,7 @@ pub struct LaunchOptions {
     pub ignore_https_errors: bool,
     pub color_scheme: Option<String>,
     pub download_path: Option<String>,
+    pub stealth: bool,
 }
 
 impl Default for LaunchOptions {
@@ -109,6 +110,7 @@ impl Default for LaunchOptions {
             ignore_https_errors: false,
             color_scheme: None,
             download_path: None,
+            stealth: true,
         }
     }
 }
@@ -138,6 +140,16 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         "--password-store=basic".to_string(),
         "--use-mock-keychain".to_string(),
     ];
+
+    // Add stealth args to defeat bot detection (Cloudflare, DataDome, etc.)
+    if options.stealth {
+        for arg in super::super::stealth::STEALTH_CHROMIUM_ARGS {
+            // Avoid duplicating args already in the base set
+            if !args.iter().any(|a| a == *arg || a.starts_with(&format!("{}=", arg.split('=').next().unwrap_or(arg)))) {
+                args.push(arg.to_string());
+            }
+        }
+    }
 
     let has_extensions = options
         .extensions

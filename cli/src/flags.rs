@@ -343,7 +343,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
 
     let mut flags = Flags {
         json: env_var_is_truthy("AGENT_BROWSER_JSON") || config.json.unwrap_or(false),
-        headed: env_var_is_truthy("AGENT_BROWSER_HEADED") || config.headed.unwrap_or(false),
+        headed: env_var_is_truthy("AGENT_BROWSER_HEADED") || config.headed.unwrap_or(true),
         debug: env_var_is_truthy("AGENT_BROWSER_DEBUG") || config.debug.unwrap_or(false),
         session: env::var("AGENT_BROWSER_SESSION")
             .ok()

@@ -1495,6 +1495,7 @@ fn launch_options_from_env() -> LaunchOptions {
             .unwrap_or(false),
         color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH").ok(),
+        stealth: super::stealth::is_stealth_enabled(None),
     }
 }
 
@@ -1712,6 +1713,9 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .get("downloadPath")
             .and_then(|v| v.as_str())
             .map(String::from),
+        stealth: super::stealth::is_stealth_enabled(
+            cmd.get("stealth").and_then(|v| v.as_bool()),
+        ),
     };
 
     // Store proxy credentials for Fetch.authRequired handling

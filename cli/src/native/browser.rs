@@ -234,6 +234,7 @@ impl BrowserManager {
         }
 
         let ignore_https_errors = options.ignore_https_errors;
+        let stealth = options.stealth;
         let user_agent = options.user_agent.clone();
         let color_scheme = options.color_scheme.clone();
         let download_path = options.download_path.clone();
@@ -287,6 +288,45 @@ impl BrowserManager {
                     Some(&session_id),
                 )
                 .await;
+        }
+
+        // Stealth: inject anti-detection script + realistic user-agent
+        if stealth {
+            // Inject stealth patches before any page JS runs
+            let _ = manager
+                .client
+                .send_command(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    Some(json!({ "source": super::stealth::STEALTH_INIT_SCRIPT })),
+                    Some(&session_id),
+                )
+                .await;
+
+            // Also run it on the current page immediately
+            let _ = manager
+                .client
+                .send_command(
+                    "Runtime.evaluate",
+                    Some(json!({
+                        "expression": super::stealth::STEALTH_INIT_SCRIPT,
+                        "returnByValue": true,
+                    })),
+                    Some(&session_id),
+                )
+                .await;
+
+            // Set realistic user-agent if none was explicitly provided
+            if user_agent.is_none() {
+                let ua = super::stealth::get_realistic_user_agent();
+                let _ = manager
+                    .client
+                    .send_command(
+                        "Emulation.setUserAgentOverride",
+                        Some(json!({ "userAgent": ua })),
+                        Some(&session_id),
+                    )
+                    .await;
+            }
         }
 
         if let Some(ref ua) = user_agent {
