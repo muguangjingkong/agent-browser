@@ -103,6 +103,10 @@ impl RefMap {
         entries
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     pub fn clear(&mut self) {
         self.map.clear();
         self.next_ref = 1;

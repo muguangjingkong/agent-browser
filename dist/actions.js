@@ -326,6 +326,8 @@ export async function executeCommand(command, browser) {
                 return await handleDiffScreenshot(command, browser);
             case 'diff_url':
                 return await handleDiffUrl(command, browser);
+            case 'semanticfind':
+                return await handleSemanticFind(command, browser);
             default: {
                 // TypeScript narrows to never here, but we handle it for safety
                 const unknownCommand = command;
@@ -616,6 +618,137 @@ async function handleSnapshot(command, browser) {
         snapshot: tree || 'Empty page',
         refs: Object.keys(simpleRefs).length > 0 ? simpleRefs : undefined,
     });
+}
+// ---------------------------------------------------------------------------
+// Semantic Find — fuzzy accessibility-tree search
+// ---------------------------------------------------------------------------
+function semanticScore(name, valueTxt, role, query, roleHint, isInteractive) {
+    const queryLower = query.toLowerCase();
+    const nameLower = (name || '').toLowerCase();
+    let score = 0;
+    if (!nameLower && !valueTxt) return 0;
+    // Primary signals (take max)
+    if (nameLower) {
+        if (nameLower === queryLower) {
+            score = Math.max(score, 0.95);
+        } else if (nameLower.startsWith(queryLower) || queryLower.startsWith(nameLower)) {
+            const shorter = Math.min(nameLower.length, queryLower.length);
+            const longer = Math.max(nameLower.length, queryLower.length);
+            score = Math.max(score, 0.6 + (shorter / longer) * 0.3);
+        } else if (nameLower.includes(queryLower)) {
+            const ratio = queryLower.length / nameLower.length;
+            score = Math.max(score, 0.4 + ratio * 0.3);
+        } else if (queryLower.includes(nameLower) && nameLower.length >= 3) {
+            const ratio = nameLower.length / queryLower.length;
+            score = Math.max(score, 0.35 + ratio * 0.3);
+        } else {
+            // Character-level similarity (Sørensen–Dice coefficient)
+            const bigrams = (s) => {
+                const b = new Set();
+                for (let i = 0; i < s.length - 1; i++) b.add(s.slice(i, i + 2));
+                return b;
+            };
+            const a = bigrams(nameLower), b = bigrams(queryLower);
+            let intersection = 0;
+            for (const bg of a) if (b.has(bg)) intersection++;
+            const dice = a.size + b.size > 0 ? (2 * intersection) / (a.size + b.size) : 0;
+            if (dice > 0.6) score = Math.max(score, dice * 0.7);
+        }
+    }
+    // Value text match
+    if (valueTxt) {
+        const vtLower = valueTxt.toLowerCase();
+        if (vtLower === queryLower) score = Math.max(score, 0.8);
+        else if (vtLower.includes(queryLower)) score += 0.15;
+    }
+    // Role hint
+    if (roleHint) {
+        if (role.toLowerCase() === roleHint.toLowerCase()) score += 0.15;
+        else score -= 0.05;
+    }
+    // Interactive boost
+    if (isInteractive) score += 0.05;
+    return Math.max(0, Math.min(1, score));
+}
+async function handleSemanticFind(command, browser) {
+    const query = command.query;
+    if (!query) return errorResponse(command.id, "Missing 'query' parameter");
+    const roleHint = command.role || null;
+    const topK = command.top || 5;
+    const threshold = 0.3;
+    const waitMs = command.wait || 0;
+    const deadline = waitMs > 0 ? Date.now() + waitMs : 0;
+    const INTERACTIVE = new Set([
+        'button','link','textbox','checkbox','radio','combobox','listbox',
+        'menuitem','menuitemcheckbox','menuitemradio','option','searchbox',
+        'slider','spinbutton','switch','tab','treeitem',
+    ]);
+    const CONTENT = new Set([
+        'heading','cell','gridcell','columnheader','rowheader',
+        'listitem','article','region','main','navigation',
+    ]);
+    while (true) {
+        // Get fresh snapshot (populates browser.refMap)
+        const { refs } = await browser.getSnapshot({ interactive: false, cursor: true });
+        // Score all refs
+        const scored = [];
+        for (const [refId, data] of Object.entries(refs)) {
+            const role = data.role || '';
+            const name = data.name || '';
+            const isInteractive = INTERACTIVE.has(role);
+            const isContent = CONTENT.has(role);
+            if (!isInteractive && !(isContent && name)) continue;
+            const s = semanticScore(name, null, role, query, roleHint, isInteractive);
+            if (s >= threshold) scored.push({ ref: refId, role, name, score: s });
+        }
+        scored.sort((a, b) => b.score - a.score);
+        scored.splice(topK);
+        if (scored.length > 0) {
+            const best = scored[0];
+            const matches = scored.map(m => ({
+                ref: m.ref,
+                role: m.role,
+                name: m.name,
+                score: Math.round(m.score * 100) / 100,
+            }));
+            const result = { matches, bestMatch: best.ref };
+            // Execute subaction if requested
+            if (command.subaction) {
+                const locator = browser.getLocatorFromRef(best.ref);
+                if (!locator) return errorResponse(command.id, `Could not resolve ref ${best.ref}`);
+                switch (command.subaction) {
+                    case 'click':
+                        await locator.click();
+                        result.clicked = `@${best.ref}`;
+                        break;
+                    case 'fill':
+                        await locator.fill(command.value || '');
+                        result.filled = `@${best.ref}`;
+                        break;
+                    case 'hover':
+                        await locator.hover();
+                        result.hovered = `@${best.ref}`;
+                        break;
+                    case 'check':
+                        await locator.check();
+                        result.checked = `@${best.ref}`;
+                        break;
+                    case 'text': {
+                        const text = await locator.innerText();
+                        result.text = text;
+                        break;
+                    }
+                }
+            }
+            return successResponse(command.id, result);
+        }
+        // Retry if waiting
+        if (deadline > 0 && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 200));
+            continue;
+        }
+        return errorResponse(command.id, `No element found matching: ${query}`);
+    }
 }
 async function handleEvaluate(command, browser) {
     const page = browser.getPage();

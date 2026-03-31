@@ -8,7 +8,7 @@ use super::cdp::types::{
 };
 use super::element::{resolve_ax_session, RefMap};
 
-const INTERACTIVE_ROLES: &[&str] = &[
+pub(super) const INTERACTIVE_ROLES: &[&str] = &[
     "button",
     "link",
     "textbox",
@@ -29,7 +29,7 @@ const INTERACTIVE_ROLES: &[&str] = &[
     "Iframe",
 ];
 
-const CONTENT_ROLES: &[&str] = &[
+pub(super) const CONTENT_ROLES: &[&str] = &[
     "heading",
     "cell",
     "gridcell",
@@ -1065,7 +1065,7 @@ fn count_indent(line: &str) -> usize {
     (line.len() - trimmed.len()) / 2
 }
 
-fn extract_ax_string(value: &Option<AXValue>) -> String {
+pub(super) fn extract_ax_string(value: &Option<AXValue>) -> String {
     match value {
         Some(v) => match &v.value {
             Some(Value::String(s)) => s.clone(),
@@ -1077,7 +1077,7 @@ fn extract_ax_string(value: &Option<AXValue>) -> String {
     }
 }
 
-fn extract_ax_string_opt(value: &Option<AXValue>) -> Option<String> {
+pub(super) fn extract_ax_string_opt(value: &Option<AXValue>) -> Option<String> {
     match value {
         Some(v) => match &v.value {
             Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),

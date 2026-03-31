@@ -1289,6 +1289,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "getbytestid" => handle_getbytestid(cmd, state).await,
         "nth" => handle_nth(cmd, state).await,
         "find" => handle_find(cmd, state).await,
+        "semanticfind" => handle_semanticfind(cmd, state).await,
         "evalhandle" => handle_evalhandle(cmd, state).await,
         "drag" => handle_drag(cmd, state).await,
         "expose" => handle_expose(cmd, state).await,
@@ -5381,6 +5382,75 @@ async fn handle_find(cmd: &Value, state: &DaemonState) -> Result<Value, String> 
 
     let result = mgr.evaluate(&js, None).await?;
     Ok(json!({ "elements": result, "selector": selector }))
+}
+
+async fn handle_semanticfind(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+
+    let query = cmd
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'query' parameter")?;
+    let role_hint = cmd.get("role").and_then(|v| v.as_str()).map(String::from);
+    let within_ref = cmd.get("within").and_then(|v| v.as_str()).map(String::from);
+    let wait_ms = cmd.get("wait").and_then(|v| v.as_u64());
+    let top_k = cmd.get("top").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+
+    let options = super::semantic::SemanticFindOptions {
+        query: query.to_string(),
+        role_hint,
+        within_ref,
+        wait_ms,
+        top_k,
+        threshold: 0.3,
+    };
+
+    let matches = super::semantic::semantic_find(
+        &mgr.client,
+        &session_id,
+        &options,
+        &mut state.ref_map,
+        state.active_frame_id.as_deref(),
+        &state.iframe_sessions,
+    )
+    .await?;
+
+    if matches.is_empty() {
+        return Err(format!("No element found matching: {}", query));
+    }
+
+    let best = &matches[0];
+    let best_ref = format!("@{}", best.ref_id);
+
+    let matches_json: Vec<Value> = matches
+        .iter()
+        .map(|m| {
+            json!({
+                "ref": m.ref_id,
+                "role": m.role,
+                "name": m.name,
+                "score": (m.score * 100.0).round() / 100.0,
+            })
+        })
+        .collect();
+
+    let mut response = json!({
+        "matches": matches_json,
+        "bestMatch": best.ref_id,
+    });
+
+    // Execute subaction on best match if requested
+    if cmd.get("subaction").is_some() {
+        let sub_result = execute_subaction(cmd, state, &best_ref).await?;
+        if let Value::Object(map) = sub_result {
+            for (k, v) in map {
+                response[k] = v;
+            }
+        }
+    }
+
+    Ok(response)
 }
 
 async fn handle_evalhandle(cmd: &Value, state: &DaemonState) -> Result<Value, String> {

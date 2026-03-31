@@ -1795,6 +1795,7 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         "first",
         "last",
         "nth",
+        "semantic",
     ];
 
     let locator = rest.first().ok_or_else(|| ParseError::MissingArguments {
@@ -1938,6 +1939,68 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             if let Some(v) = fv {
                 cmd["value"] = json!(v);
             }
+            Ok(cmd)
+        }
+        "semantic" => {
+            let query = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: "find semantic".to_string(),
+                usage: "find semantic <query> [click|fill|hover|check|text] [value] [--role <role>] [--within <ref>] [--wait <ms>] [--top <n>]",
+            })?;
+
+            let mut cmd = json!({
+                "id": id,
+                "action": "semanticfind",
+                "query": query,
+            });
+
+            let mut i = 2;
+            let mut subaction_set = false;
+            while i < rest.len() {
+                match rest[i] {
+                    "--role" => {
+                        if let Some(v) = rest.get(i + 1) {
+                            cmd["role"] = json!(v);
+                        }
+                        i += 2;
+                    }
+                    "--within" => {
+                        if let Some(v) = rest.get(i + 1) {
+                            cmd["within"] = json!(v);
+                        }
+                        i += 2;
+                    }
+                    "--wait" => {
+                        let ms = rest
+                            .get(i + 1)
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(5000);
+                        cmd["wait"] = json!(ms);
+                        i += 2;
+                    }
+                    "--top" => {
+                        let n = rest
+                            .get(i + 1)
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(5);
+                        cmd["top"] = json!(n);
+                        i += 2;
+                    }
+                    token
+                        if !subaction_set
+                            && matches!(token, "click" | "fill" | "hover" | "check" | "text") =>
+                    {
+                        cmd["subaction"] = json!(token);
+                        subaction_set = true;
+                        i += 1;
+                    }
+                    _ => {
+                        // Remaining tokens become the fill value
+                        cmd["value"] = json!(rest[i..].join(" "));
+                        break;
+                    }
+                }
+            }
+
             Ok(cmd)
         }
         _ => Err(ParseError::UnknownSubcommand {
@@ -2325,6 +2388,7 @@ mod tests {
             screenshot_format: None,
             idle_timeout: None,
             no_auto_dialog: false,
+            no_stealth: false,
         }
     }
 
