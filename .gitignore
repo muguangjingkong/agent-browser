@@ -67,3 +67,6 @@ trace.json
 # next
 .next/
 out/
+
+# Serena
+.serena/
